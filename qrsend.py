@@ -119,23 +119,26 @@ def show_loop(frames, version, fps, session, max_passes=0):
     screen_h = root.winfo_height() - 60
     screen_w = root.winfo_width()
 
-    # Pre-render every frame as a Tk image at integer module scale. Integer
-    # scaling keeps module edges pixel-sharp -- resampled edges blur under
-    # remote-desktop compression and stop decoding.
-    matrices = []
-    for text in frames:
-        qr = make_qr(text, version)
-        rows = [list(row) for row in qr.matrix]
-        matrices.append(rows)
-
-    side = len(matrices[0])
+    # Render each frame on demand rather than all up front. Building every
+    # image before the first paint caused a white screen and an unresponsive
+    # window (Esc ignored) on large files. Geometry is constant because every
+    # frame uses the same QR version, so compute it once from frame 0.
+    side = len(make_qr(frames[0], version).matrix)
     quiet = 6
     total_modules = side + 2 * quiet
     scale = max(3, min(screen_w, screen_h) // total_modules)
+    px = total_modules * scale
 
-    images = []
-    for rows in matrices:
-        px = total_modules * scale
+    from collections import OrderedDict
+    cache = OrderedDict()
+    CACHE_MAX = 128
+
+    def render(i):
+        hit = cache.get(i)
+        if hit is not None:
+            cache.move_to_end(i)
+            return hit
+        rows = make_qr(frames[i], version).matrix
         img = tk.PhotoImage(width=px, height=px)
         img.put("white", to=(0, 0, px, px))
         for r, row in enumerate(rows):
@@ -151,20 +154,24 @@ def show_loop(frames, version, fps, session, max_passes=0):
                     y1 = y0 + scale
                     img.put("black", to=(x0, y0, x1, y1))
                     run_start = None
-        images.append(img)
+        cache[i] = img
+        if len(cache) > CACHE_MAX:
+            cache.popitem(last=False)
+        return img
 
-    img_id = canvas.create_image(screen_w // 2, screen_h // 2, image=images[0])
+    n = len(frames)
+    img_id = canvas.create_image(screen_w // 2, screen_h // 2, image=render(0))
     state = {"i": 0, "pass": 1}
 
     def tick():
         i = state["i"]
-        canvas.itemconfig(img_id, image=images[i])
+        canvas.itemconfig(img_id, image=render(i))
         cap = f"/{max_passes}" if max_passes else ""
         label.config(
-            text=f"session {session:04X}   frame {i + 1}/{len(images)}   "
+            text=f"session {session:04X}   frame {i + 1}/{n}   "
                  f"pass {state['pass']}{cap}"
         )
-        state["i"] = (i + 1) % len(images)
+        state["i"] = (i + 1) % n
         if state["i"] == 0:
             if max_passes and state["pass"] >= max_passes:
                 root.after(delay, root.destroy)   # hold last frame, then quit
@@ -174,7 +181,8 @@ def show_loop(frames, version, fps, session, max_passes=0):
 
     root.bind("<Escape>", lambda e: root.destroy())
     root.bind("q", lambda e: root.destroy())
-    tick()
+    root.focus_force()          # so key bindings receive Esc immediately
+    root.after(delay, tick)     # start via the event loop, not inline
     root.mainloop()
 
 

@@ -143,15 +143,29 @@ def show_loop(frames, indices, version, fps, session, max_passes=0):
     screen_h = root.winfo_height() - 60
     screen_w = root.winfo_width()
 
-    matrices = [[list(row) for row in make_qr(f, version).matrix] for f in frames]
-    side = len(matrices[0])
+    # Geometry is constant: every frame is the same QR version, so all codes
+    # share one module count. Compute it once from frame 0.
+    side = len(make_qr(frames[0], version).matrix)
     quiet = 6
     span = side + 2 * quiet
     scale = max(3, min(screen_w, screen_h) // span)
+    px = span * scale
 
-    images = []
-    for rows in matrices:
-        px = span * scale
+    # Render one frame to a PhotoImage on demand, not all up front. Building
+    # every image before showing anything is what caused a white screen (and a
+    # frozen window that ignored Esc) on large files -- tens of thousands of
+    # images can't be built in memory. A small cache keeps looping smooth
+    # without holding more than a handful of images at once.
+    from collections import OrderedDict
+    cache = OrderedDict()
+    CACHE_MAX = 128
+
+    def render(i):
+        hit = cache.get(i)
+        if hit is not None:
+            cache.move_to_end(i)
+            return hit
+        rows = make_qr(frames[i], version).matrix
         img = tk.PhotoImage(width=px, height=px)
         img.put("white", to=(0, 0, px, px))
         for r, row in enumerate(rows):
@@ -164,18 +178,22 @@ def show_loop(frames, indices, version, fps, session, max_passes=0):
                     img.put("black", to=((quiet + start) * scale, (quiet + r) * scale,
                                          (quiet + c) * scale, (quiet + r) * scale + scale))
                     start = None
-        images.append(img)
+        cache[i] = img
+        if len(cache) > CACHE_MAX:
+            cache.popitem(last=False)
+        return img
 
-    img_id = canvas.create_image(screen_w // 2, screen_h // 2, image=images[0])
+    n = len(frames)
+    img_id = canvas.create_image(screen_w // 2, screen_h // 2, image=render(0))
     state = {"i": 0, "pass": 1}
 
     def tick():
         i = state["i"]
-        canvas.itemconfig(img_id, image=images[i])
+        canvas.itemconfig(img_id, image=render(i))
         cap = f"/{max_passes}" if max_passes else ""
         label.config(text=f"session {session:04X}   frame {indices[i]}   "
-                          f"({i + 1}/{len(images)})   pass {state['pass']}{cap}")
-        state["i"] = (i + 1) % len(images)
+                          f"({i + 1}/{n})   pass {state['pass']}{cap}")
+        state["i"] = (i + 1) % n
         if state["i"] == 0:
             # Just displayed the last frame of this pass. Stop if we've now
             # shown the requested number of full passes -- but hold this final
@@ -189,7 +207,8 @@ def show_loop(frames, indices, version, fps, session, max_passes=0):
 
     root.bind("<Escape>", lambda e: root.destroy())
     root.bind("q", lambda e: root.destroy())
-    tick()
+    root.focus_force()          # so key bindings receive Esc immediately
+    root.after(delay, tick)     # start via the event loop, not inline
     root.mainloop()
 
 
@@ -247,6 +266,20 @@ def main():
     if args.dump_dir:
         dump_frames(frames, indices, args.version, args.dump_dir)
     else:
+        # Optical QR suits small files. Past a few hundred frames a single pass
+        # takes many minutes; warn rather than silently open a multi-hour run.
+        if not args.only and len(frames) > 400:
+            pass_min = len(frames) / args.fps / 60
+            print(f"\n⚠  {len(frames)} frames ≈ {pass_min:.0f} min per pass. "
+                  f"This is a lot for an optical link.")
+            print("   Consider a higher --version (more bytes/frame), or split the "
+                  "file. See notes below.")
+            try:
+                if input("   Continue anyway? [y/N] ").strip().lower() != "y":
+                    print("   Aborted.")
+                    return
+            except EOFError:
+                pass
         stop = "after " + str(args.passes) + " passes" if args.passes else "Press Esc or q"
         print(f"\nFullscreen window opening. Stops {stop}.")
         show_loop(frames, indices, args.version, args.fps, session, args.passes)

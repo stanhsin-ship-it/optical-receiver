@@ -101,7 +101,7 @@ def make_qr(text: str, version: int):
 # Display
 # --------------------------------------------------------------------------
 
-def show_loop(frames, version, fps, session):
+def show_loop(frames, version, fps, session, max_passes=0):
     import tkinter as tk
 
     delay = int(1000 / fps)
@@ -159,11 +159,16 @@ def show_loop(frames, version, fps, session):
     def tick():
         i = state["i"]
         canvas.itemconfig(img_id, image=images[i])
+        cap = f"/{max_passes}" if max_passes else ""
         label.config(
-            text=f"session {session:04X}   frame {i + 1}/{len(images)}   pass {state['pass']}"
+            text=f"session {session:04X}   frame {i + 1}/{len(images)}   "
+                 f"pass {state['pass']}{cap}"
         )
         state["i"] = (i + 1) % len(images)
         if state["i"] == 0:
+            if max_passes and state["pass"] >= max_passes:
+                root.after(delay, root.destroy)   # hold last frame, then quit
+                return
             state["pass"] += 1
         root.after(delay, tick)
 
@@ -190,6 +195,10 @@ def main():
     ap.add_argument("--fps", type=float, default=2.0,
                     help="Frames per second. Default 2 -- slow enough for a "
                          "remote desktop to fully paint each code.")
+    ap.add_argument("--passes", type=int, default=0, metavar="N",
+                    help="Stop automatically after N full loops, then exit. The "
+                         "receiver completes in about one pass, so 3-5 gives margin "
+                         "with no back-channel. Default 0 = loop until Esc.")
     ap.add_argument("--dump-dir", help="Write PNG frames here instead of opening a window.")
     args = ap.parse_args()
 
@@ -209,12 +218,15 @@ def main():
     print(f"QR          version {args.version}, ECC H, {payload_size} bytes/frame")
     print(f"Frames      {len(frames)}   one full pass = {secs:.0f}s at {args.fps} fps")
     print(f"Session     {session:04X}")
+    if args.passes:
+        print(f"Auto-stop   after {args.passes} passes (~{secs * args.passes:.0f}s)")
 
     if args.dump_dir:
         dump_frames(frames, args.version, args.dump_dir)
     else:
-        print("\nFullscreen window opening. Press Esc or q to stop.")
-        show_loop(frames, args.version, args.fps, session)
+        stop = f"after {args.passes} passes" if args.passes else "Press Esc or q"
+        print(f"\nFullscreen window opening. Stops {stop}.")
+        show_loop(frames, args.version, args.fps, session, args.passes)
 
 
 if __name__ == "__main__":

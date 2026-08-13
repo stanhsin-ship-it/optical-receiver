@@ -125,7 +125,7 @@ def make_qr(text: str, version: int):
 
 # --------------------------------------------------------------------------
 
-def show_loop(frames, indices, version, fps, session):
+def show_loop(frames, indices, version, fps, session, max_passes=0):
     import tkinter as tk
 
     delay = int(1000 / fps)
@@ -172,10 +172,18 @@ def show_loop(frames, indices, version, fps, session):
     def tick():
         i = state["i"]
         canvas.itemconfig(img_id, image=images[i])
+        cap = f"/{max_passes}" if max_passes else ""
         label.config(text=f"session {session:04X}   frame {indices[i]}   "
-                          f"({i + 1}/{len(images)})   pass {state['pass']}")
+                          f"({i + 1}/{len(images)})   pass {state['pass']}{cap}")
         state["i"] = (i + 1) % len(images)
         if state["i"] == 0:
+            # Just displayed the last frame of this pass. Stop if we've now
+            # shown the requested number of full passes -- but hold this final
+            # frame on screen for its full duration first, so the receiver has
+            # a fair chance at it.
+            if max_passes and state["pass"] >= max_passes:
+                root.after(delay, root.destroy)
+                return
             state["pass"] += 1
         root.after(delay, tick)
 
@@ -200,6 +208,11 @@ def main():
                     help="QR version, 4-15. Lower survives compression better but "
                          "needs more frames. Default 6.")
     ap.add_argument("--fps", type=float, default=2.0, help="Frames per second. Default 2.")
+    ap.add_argument("--passes", type=int, default=0, metavar="N",
+                    help="Stop automatically after N full loops through the frames, "
+                         "then exit. The screen-capture receiver completes in about "
+                         "one pass, so 3-5 gives comfortable margin with no back-channel. "
+                         "Default 0 = loop forever until you press Esc.")
     ap.add_argument("--only", help="Replay only these frames, e.g. 7,19,55-61. Use the "
                                    "same --version as the original run.")
     ap.add_argument("--dump-dir", help="Write PNG frames here instead of opening a window.")
@@ -226,13 +239,17 @@ def main():
     if args.only:
         print(f"Replaying   {len(frames)} of {len(blob) // payload_size + 1} frames: {args.only}")
     else:
-        print(f"Frames      {len(frames)}   one pass = {len(frames) / args.fps:.0f}s at {args.fps} fps")
+        pass_secs = len(frames) / args.fps
+        print(f"Frames      {len(frames)}   one pass = {pass_secs:.0f}s at {args.fps} fps")
+        if args.passes:
+            print(f"Auto-stop   after {args.passes} passes (~{pass_secs * args.passes:.0f}s)")
 
     if args.dump_dir:
         dump_frames(frames, indices, args.version, args.dump_dir)
     else:
-        print("\nFullscreen window opening. Press Esc or q to stop.")
-        show_loop(frames, indices, args.version, args.fps, session)
+        stop = "after " + str(args.passes) + " passes" if args.passes else "Press Esc or q"
+        print(f"\nFullscreen window opening. Stops {stop}.")
+        show_loop(frames, indices, args.version, args.fps, session, args.passes)
 
 
 if __name__ == "__main__":

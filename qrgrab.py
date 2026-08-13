@@ -248,6 +248,11 @@ def main():
     ap.add_argument("--scale", type=float, default=1.0,
                     help="Downscale factor before detection, e.g. 0.5 on a 4K screen "
                          "to speed up. QR must stay large enough to decode. Default 1.0.")
+    ap.add_argument("--no-stable", action="store_true",
+                    help="Disable the settled-frame gate. By default a frame is only "
+                         "decoded once two consecutive grabs match, which rejects "
+                         "codes caught mid-repaint by NoMachine. Turn off only if the "
+                         "screen never holds a code still.")
     args = ap.parse_args()
 
     detector = cv2.QRCodeDetector()
@@ -255,6 +260,8 @@ def main():
     period = 1.0 / args.fps
     last_report = 0.0
     grabbed = 0
+    prev = None          # previous grayscale grab, for the settled-frame gate
+    stable = not args.no_stable
 
     with mss() as sct:
         if args.monitor >= len(sct.monitors):
@@ -277,6 +284,22 @@ def main():
                 if args.scale != 1.0:
                     img = cv2.resize(img, None, fx=args.scale, fy=args.scale,
                                      interpolation=cv2.INTER_AREA)
+
+                # Settled-frame gate: NoMachine repaints in pieces, so an
+                # instantaneous grab can catch a QR half-updated. Decoding only
+                # when this grab equals the last one guarantees the code has
+                # stopped changing -- the single biggest win for stability.
+                # The desktop behind the code is static, so equality effectively
+                # tests "is the QR the same as a moment ago".
+                if stable:
+                    settled = prev is not None and img.shape == prev.shape \
+                        and np.array_equal(img, prev)
+                    prev = img
+                    if not settled:
+                        dt = period - (time.time() - t0)
+                        if dt > 0:
+                            time.sleep(dt)
+                        continue
 
                 added = False
                 for t in decode_frame(img, detector):

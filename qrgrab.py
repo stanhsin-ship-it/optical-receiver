@@ -35,7 +35,11 @@ import sys
 import time
 
 import numpy as np
-from mss import mss
+from mss import mss as _mss_factory
+try:
+    from mss import MSS as _MSS
+except Exception:
+    _MSS = None
 
 # Two decoders, chosen at startup. pyzbar (the ZBar library) is markedly more
 # robust on marginal codes than OpenCV -- in testing it read frames OpenCV
@@ -237,6 +241,26 @@ def draw_bar(got, total, width=32):
     return "[" + "#" * filled + "." * (width - filled) + f"] {got}/{total}"
 
 
+class Line:
+    """Prints an updating status line with \\r, padding each write to the
+    widest line seen so a shorter update fully erases the previous one.
+    Without this, a short 'missing: none' printed over a long index list
+    leaves stale characters behind on the terminal."""
+
+    def __init__(self):
+        self.width = 0
+
+    def show(self, text):
+        pad = max(0, self.width - len(text))
+        self.width = max(self.width, len(text))
+        print(text + " " * pad, end="\r", flush=True)
+
+    def clear(self):
+        if self.width:
+            print(" " * self.width, end="\r", flush=True)
+            self.width = 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Screen-capture receiver for optical QR transfer.")
     ap.add_argument("--monitor", type=int, default=1,
@@ -262,8 +286,10 @@ def main():
     grabbed = 0
     prev = None          # previous grayscale grab, for the settled-frame gate
     stable = not args.no_stable
+    line = Line()
 
-    with mss() as sct:
+    _open = _MSS if _MSS is not None else _mss_factory
+    with _open() as sct:
         if args.monitor >= len(sct.monitors):
             sys.exit(f"Monitor {args.monitor} not found. Available: 1..{len(sct.monitors)-1}")
         mon = sct.monitors[args.monitor]
@@ -306,12 +332,12 @@ def main():
                     if sess.offer(t):
                         added = True
                 if added:
-                    print("  " + draw_bar(len(sess.chunks), sess.total)
-                          + "   missing: " + (sess.missing_spec() or "none"),
-                          end="\r", flush=True)
+                    line.show("  " + draw_bar(len(sess.chunks), sess.total)
+                              + "   missing: " + (sess.missing_spec() or "none"))
 
                 if sess.complete:
                     path, err = sess.assemble(args.out)
+                    line.clear()
                     print()
                     if err:
                         print("Reassembly failed:", err)
@@ -324,7 +350,7 @@ def main():
 
                 now = time.time()
                 if now - last_report > 3 and sess.sid is None:
-                    print(f"  …scanning ({grabbed} grabs, no signal yet)", end="\r", flush=True)
+                    line.show(f"  …scanning ({grabbed} grabs, no signal yet)")
                     last_report = now
 
                 dt = period - (time.time() - t0)
@@ -332,7 +358,8 @@ def main():
                     time.sleep(dt)
 
         except KeyboardInterrupt:
-            print("\n\nStopped.")
+            line.clear()
+            print("\nStopped.")
             if sess.sid is None:
                 print("No signal was locked.")
             else:

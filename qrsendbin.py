@@ -262,16 +262,28 @@ def make_qr(text: str, version: int):
 
 # --------------------------------------------------------------------------
 
-def show_loop(segments, version, fps, max_passes=0):
+def show_loop(segments, version, fps, max_passes=0, gap_ticks=4, seg_repeat=1):
     """Play a list of segments in sequence, each its own session, looping the
     whole list max_passes times (0 = forever). A single-file transfer is just a
-    one-element list, so behaviour there is unchanged. A short blank gap between
-    segments lets the receiver's settled-frame gate finalise each session before
-    the next one starts."""
+    one-element list, so behaviour there is unchanged.
+
+    gap_ticks blank frames sit between segments. This matters at part
+    boundaries: when the receiver finishes a part it needs a moment to decode,
+    verify, write the file and run the auto-join before it can lock the next
+    session. If the next part's opening frames appear during that busy window
+    they are missed, and the receiver only recovers them a full loop later --
+    which on a short run can mean a part never completes. A blank gap parks the
+    screen while the receiver catches up, so the next part starts clean.
+
+    seg_repeat plays each multi-part segment that many times back-to-back before
+    moving on. A missed opening frame is then re-shown seconds later instead of
+    a whole loop later, which is the main defence against 'part 1 fine, part 2
+    never arrives'. Single-segment transfers ignore it."""
     import tkinter as tk
 
     delay = int(1000 / fps)
-    gap_ticks = 2                      # blank frames between segments
+    if len(segments) == 1:
+        seg_repeat = 1                 # nothing to protect at a boundary
     root = tk.Tk()
     root.title("qrsendbin")
     root.configure(bg="white")
@@ -325,7 +337,7 @@ def show_loop(segments, version, fps, max_passes=0):
         return img
 
     img_id = canvas.create_image(screen_w // 2, screen_h // 2, image=blank)
-    st = {"seg": 0, "i": 0, "pass": 1, "gap": gap_ticks}   # start with a gap
+    st = {"seg": 0, "i": 0, "pass": 1, "gap": gap_ticks, "rep": 1}   # start with a gap
 
     def tick():
         # Blank gap between segments / before the first one.
@@ -333,7 +345,8 @@ def show_loop(segments, version, fps, max_passes=0):
             canvas.itemconfig(img_id, image=blank)
             seg = segments[st["seg"]]
             cap = f"/{max_passes}" if max_passes else ""
-            label.config(text=f"{seg['label']}   (starting…)   pass {st['pass']}{cap}")
+            rep = f" [{st['rep']}/{seg_repeat}]" if seg_repeat > 1 else ""
+            label.config(text=f"{seg['label']}{rep}   (starting…)   pass {st['pass']}{cap}")
             st["gap"] -= 1
             root.after(delay, tick)
             return
@@ -343,13 +356,23 @@ def show_loop(segments, version, fps, max_passes=0):
         i = st["i"]
         canvas.itemconfig(img_id, image=render(frames[i]))
         cap = f"/{max_passes}" if max_passes else ""
-        label.config(text=f"{seg['label']}   frame {seg['indices'][i]} "
+        rep = f" [{st['rep']}/{seg_repeat}]" if seg_repeat > 1 else ""
+        label.config(text=f"{seg['label']}{rep}   frame {seg['indices'][i]} "
                           f"({i + 1}/{len(frames)})   sess {seg['session']:04X}   "
                           f"pass {st['pass']}{cap}")
 
         st["i"] += 1
         if st["i"] >= len(frames):
             st["i"] = 0
+            # Replay this same segment seg_repeat times before advancing, so a
+            # frame missed while the receiver was busy at the boundary comes
+            # back around within seconds rather than a whole loop later.
+            if st["rep"] < seg_repeat:
+                st["rep"] += 1
+                st["gap"] = gap_ticks
+                root.after(delay, tick)
+                return
+            st["rep"] = 1
             st["seg"] += 1
             st["gap"] = gap_ticks
             if st["seg"] >= len(segments):        # finished a full pass
@@ -399,6 +422,14 @@ def main():
                          "this size (k/m suffixes ok). Default 40k.")
     ap.add_argument("--no-split", action="store_true",
                     help="Never auto-split; send as one long session no matter the size.")
+    ap.add_argument("--part-repeat", type=int, default=2, metavar="N",
+                    help="In an auto-split transfer, play each part N times back-to-back "
+                         "before the next. Guards against the receiver missing a part's "
+                         "opening frames while it's busy finishing the previous part. "
+                         "Default 2.")
+    ap.add_argument("--gap", type=int, default=4, metavar="TICKS",
+                    help="Blank frames shown between parts, giving the receiver time to "
+                         "write and auto-join before the next part starts. Default 4.")
     ap.add_argument("--dump-dir", help="Write PNG frames here instead of opening a window "
                                        "(single-session only; ignores auto-split).")
     args = ap.parse_args()
@@ -439,7 +470,8 @@ def main():
     if was_split:
         parts = len(segments) - 1
         print(f"Auto-split  {parts} parts + manifest, {total_frames} frames total")
-        print(f"            receiver rebuilds automatically (qrgrab). Manifest sent first.")
+        print(f"            each part shown {max(1, args.part_repeat)}x per pass; "
+              f"receiver rebuilds automatically (qrgrab). Manifest sent first.")
     else:
         print(f"Session     {segments[0]['session']:04X}")
     pass_secs = total_frames / args.fps
@@ -466,7 +498,8 @@ def main():
         print("Receiver saves one .tar; rebuild it there with:  "
               f"tar xf {os.path.basename(os.path.normpath(args.file))}.tar")
     print(f"\nFullscreen window opening. Stops {stop}.")
-    show_loop(segments, args.version, args.fps, args.passes)
+    show_loop(segments, args.version, args.fps, args.passes,
+              gap_ticks=max(0, args.gap), seg_repeat=max(1, args.part_repeat))
 
 
 if __name__ == "__main__":

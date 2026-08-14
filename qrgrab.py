@@ -261,6 +261,47 @@ class Line:
             self.width = 0
 
 
+def try_autojoin(out_dir):
+    """If a .qrmanifest and all its parts are present in out_dir, rebuild the
+    original file, verify its whole-file SHA-256, and write it. Returns a list
+    of (name, ok, detail) for each manifest found, or [] if none are complete."""
+    import glob
+    import json
+
+    results = []
+    for mpath in sorted(glob.glob(os.path.join(out_dir, "*.qrmanifest"))):
+        try:
+            with open(mpath, encoding="utf-8") as fh:
+                m = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if m.get("format") != "qrpack1":
+            continue
+        name, total = m["name"], m["parts"]
+        width = m.get("part_width", max(3, len(str(total))))
+        parts, missing = [], []
+        for idx in range(1, total + 1):
+            pname = f"{name}.qrpart{idx:0{width}d}-of-{total}"
+            ppath = os.path.join(out_dir, pname)
+            if os.path.exists(ppath):
+                with open(ppath, "rb") as fh:
+                    parts.append(fh.read())
+            else:
+                missing.append(idx)
+        if missing:
+            results.append((name, False, f"missing parts {missing}", len(missing), total))
+            continue
+        data = b"".join(parts)
+        if hashlib.sha256(data).hexdigest() != m["sha256"]:
+            results.append((name, False, "whole-file checksum failed", 0, total))
+            continue
+        out_path = os.path.join(out_dir, name)
+        with open(out_path, "wb") as fh:
+            fh.write(data)
+        results.append((name, True, out_path, 0, total))
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser(description="Screen-capture receiver for optical QR transfer.")
     ap.add_argument("--monitor", type=int, default=1,
@@ -287,6 +328,7 @@ def main():
     prev = None          # previous grayscale grab, for the settled-frame gate
     stable = not args.no_stable
     line = Line()
+    seen_parts = set()   # filenames of parts/manifests captured so far
 
     _open = _MSS if _MSS is not None else _mss_factory
     with _open() as sct:
@@ -343,10 +385,43 @@ def main():
                         print("Reassembly failed:", err)
                         print("Reset the sender and capture again, or replay --only",
                               sess.missing_spec() or "(all)")
-                        return 1
-                    size = os.path.getsize(path)
-                    print(f"Done. Wrote {path}  ({size} bytes). Checksum verified.")
-                    return 0
+                        # Don't abort a multi-part run over one bad session; keep going.
+                        sess = Session()
+                        prev = None
+                        continue
+
+                    fname = os.path.basename(path)
+                    is_manifest = fname.endswith(".qrmanifest")
+                    is_part = ".qrpart" in fname and "-of-" in fname
+
+                    if not is_manifest and not is_part:
+                        # An ordinary single-file transfer: done.
+                        size = os.path.getsize(path)
+                        print(f"Done. Wrote {path}  ({size} bytes). Checksum verified.")
+                        return 0
+
+                    # Multi-part: record this piece, then see if we can rebuild.
+                    seen_parts.add(fname)
+                    kind = "manifest" if is_manifest else "part"
+                    print(f"Captured {kind}: {fname}")
+                    joins = try_autojoin(args.out)
+                    for name, ok, detail, nmiss, total in joins:
+                        if ok:
+                            size = os.path.getsize(detail)
+                            print(f"\n✅ Rebuilt {name} ({size} bytes) from {total} parts. "
+                                  f"Checksum verified → {detail}")
+                            if name.endswith(".tar"):
+                                print(f"   It's a folder archive; unpack with:  tar xf {name}")
+                            return 0
+                    # Not complete yet: show how many parts still outstanding.
+                    pending = [d for _, ok, d, nm, tot in joins if not ok]
+                    if pending:
+                        line.show("  waiting for more parts… " + "; ".join(pending))
+                    else:
+                        line.show("  waiting for manifest…")
+                    sess = Session()      # reset to accept the next session
+                    prev = None
+                    continue
 
                 now = time.time()
                 if now - last_report > 3 and sess.sid is None:
@@ -360,7 +435,19 @@ def main():
         except KeyboardInterrupt:
             line.clear()
             print("\nStopped.")
-            if sess.sid is None:
+            if seen_parts:
+                joins = try_autojoin(args.out)
+                done = [n for n, ok, *_ in joins if ok]
+                if done:
+                    print("Rebuilt:", ", ".join(done))
+                for name, ok, detail, nmiss, total in joins:
+                    if not ok:
+                        print(f"{name}: incomplete — {detail}. "
+                              f"Re-send the missing part(s) and run again; captured "
+                              f"parts stay in {args.out}/.")
+                if not joins:
+                    print(f"Captured {len(seen_parts)} piece(s) but no manifest yet.")
+            elif sess.sid is None:
                 print("No signal was locked.")
             else:
                 miss = sess.missing_spec()

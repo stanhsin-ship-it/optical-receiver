@@ -106,6 +106,20 @@ def crc16_ccitt(data: bytes) -> int:
     return crc
 
 
+def peek_sid(text: str):
+    """Return the session id of a decoded frame without collecting it, or None
+    if it isn't one of ours. Lets the loop skip a session it already finished."""
+    raw = b45_decode(text.strip())
+    if not raw or len(raw) < 10:
+        return None
+    if raw[:2] not in (BIN_MAGIC, TEXT_MAGIC):
+        return None
+    body_len = len(raw) - 2
+    if crc16_ccitt(raw[:body_len]) != struct.unpack(">H", raw[body_len:])[0]:
+        return None
+    return struct.unpack(">H", raw[2:4])[0]
+
+
 class Session:
     """Collects frames for one transfer and reassembles when complete."""
 
@@ -329,6 +343,7 @@ def main():
     stable = not args.no_stable
     line = Line()
     seen_parts = set()   # filenames of parts/manifests captured so far
+    done_sids = set()    # session ids already completed — never re-collect them
 
     _open = _MSS if _MSS is not None else _mss_factory
     with _open() as sct:
@@ -371,6 +386,14 @@ def main():
 
                 added = False
                 for t in decode_frame(img, detector):
+                    # A completed part often stays on screen (the sender holds and
+                    # repeats it). Without this guard the receiver re-locks that
+                    # same session, re-collects the part it already has, and never
+                    # frees itself to catch the *next* part — a livelock that looks
+                    # like "stuck on part 2". If we're not already locked onto a
+                    # session, ignore frames from any session we've finished.
+                    if sess.sid is None and peek_sid(t) in done_sids:
+                        continue
                     if sess.offer(t):
                         added = True
                 if added:
@@ -385,7 +408,9 @@ def main():
                         print("Reassembly failed:", err)
                         print("Reset the sender and capture again, or replay --only",
                               sess.missing_spec() or "(all)")
-                        # Don't abort a multi-part run over one bad session; keep going.
+                        # Don't abort a multi-part run over one bad session; keep
+                        # going and let this part be re-collected on its next
+                        # showing (so it is NOT added to done_sids).
                         sess = Session()
                         prev = None
                         continue
@@ -401,6 +426,7 @@ def main():
                         return 0
 
                     # Multi-part: record this piece, then see if we can rebuild.
+                    done_sids.add(sess.sid)
                     seen_parts.add(fname)
                     kind = "manifest" if is_manifest else "part"
                     print(f"Captured {kind}: {fname}")

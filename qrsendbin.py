@@ -44,6 +44,11 @@ FLAG_GZIP = 0x01
 ALNUM_CAP_H = {
     4: 50, 5: 64, 6: 84, 7: 93, 8: 122, 9: 143, 10: 174,
     11: 200, 12: 227, 13: 259, 14: 283, 15: 321,
+    16: 365, 17: 408, 18: 452, 19: 493, 20: 557,
+    21: 587, 22: 640, 23: 672, 24: 744, 25: 779,
+    26: 864, 27: 910, 28: 958, 29: 1016, 30: 1080,
+    31: 1150, 32: 1226, 33: 1307, 34: 1394, 35: 1431,
+    36: 1530, 37: 1591, 38: 1658, 39: 1774, 40: 1852,
 }
 
 BASE45_CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
@@ -375,8 +380,11 @@ def main():
     ap.add_argument("file", help="File to send, OR a folder (packed into one .tar "
                                  "and sent whole; rebuild on the far side with tar xf).")
     ap.add_argument("--version", type=int, default=6, choices=sorted(ALNUM_CAP_H),
-                    help="QR version, 4-15. Lower survives compression better but "
-                         "needs more frames. Default 6.")
+                    help="QR version, 4-40 (40 is the largest the QR standard "
+                         "defines). Higher packs more bytes/frame (fewer frames) but "
+                         "the code is denser and NoMachine compression may blur it "
+                         "past decoding. Above ~15, test one frame over your real NX "
+                         "link before a full run. Default 6.")
     ap.add_argument("--fps", type=float, default=2.0, help="Frames per second. Default 2.")
     ap.add_argument("--passes", type=int, default=0, metavar="N",
                     help="Stop automatically after N full loops through the frames, "

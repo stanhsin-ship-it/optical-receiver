@@ -208,6 +208,7 @@ class Session:
         self.proto = fr.proto
         self.chunks = {}
         self.started = self.last = time.time()
+        self.quiet = False   # a repeat of something already written
 
     def add(self, fr: Frame) -> bool:
         """Take one frame. Returns True if it was new."""
@@ -372,11 +373,7 @@ class Line:
         print(*args, flush=True)
 
 
-Join = namedtuple("Join", "manifest name ok detail missing total path")
-
-# Part paths consumed by each successful join, so --clean-parts can remove
-# exactly what was used and nothing else.
-_JOIN_PARTS = {}
+Join = namedtuple("Join", "manifest name ok detail missing total path parts")
 
 
 def try_autojoin(out_dir, skip=()):
@@ -403,30 +400,35 @@ def try_autojoin(out_dir, skip=()):
             continue
         name, total = m["name"], m["parts"]
         width = m.get("part_width", max(3, len(str(total))))
-        parts, missing, ppaths = [], [], []
+        # Stat every part before reading any. This runs after each captured
+        # piece, and an abandoned transfer's parts sit in the folder for the
+        # life of the process -- reading them all only to discover one is still
+        # missing would make every later capture slower than the last.
+        ppaths, missing = [], []
         for idx in range(1, total + 1):
             pname = f"{name}.qrpart{idx:0{width}d}-of-{total}"
             ppath = os.path.join(out_dir, safe_name(pname))
             if os.path.exists(ppath):
-                with open(ppath, "rb") as fh:
-                    parts.append(fh.read())
                 ppaths.append(ppath)
             else:
                 missing.append(idx)
         if missing:
             results.append(Join(mpath, name, False, f"missing parts {missing}",
-                                len(missing), total, None))
+                                len(missing), total, None, ()))
             continue
-        data = b"".join(parts)
+        chunks = []
+        for ppath in ppaths:
+            with open(ppath, "rb") as fh:
+                chunks.append(fh.read())
+        data = b"".join(chunks)
         if hashlib.sha256(data).hexdigest() != m["sha256"]:
             results.append(Join(mpath, name, False, "whole-file checksum failed",
-                                0, total, None))
+                                0, total, None, ()))
             continue
         path, note = save_bytes(out_dir, name, data)
-        # Remember the pieces this rebuild consumed, so --clean-parts removes
-        # exactly those and never a part belonging to another transfer.
-        _JOIN_PARTS[mpath] = ppaths
-        results.append(Join(mpath, name, True, note, 0, total, path))
+        # The pieces this rebuild consumed travel with the result, so
+        # --clean-parts removes exactly those and never another transfer's.
+        results.append(Join(mpath, name, True, note, 0, total, path, tuple(ppaths)))
     return results
 
 
@@ -452,11 +454,6 @@ def main():
                     help="Exit after the first completed file (the old behaviour). "
                          "By default the receiver keeps running and takes transfer "
                          "after transfer until you press Ctrl-C.")
-    ap.add_argument("--rearm", type=float, default=300.0, metavar="SECS",
-                    help="A finished file is ignored while its frames are still on "
-                         "screen. Once they have been gone this long, sending the "
-                         "same file again is treated as a new transfer. Default 300. "
-                         "0 = never accept the same session twice in one run.")
     ap.add_argument("--forget", type=float, default=900.0, metavar="SECS",
                     help="Drop a half-collected session that has not been seen for "
                          "this long, reporting its missing frames. Default 900.")
@@ -479,8 +476,7 @@ def main():
     # transfer no longer blocks the next one, and a session interrupted by other
     # traffic resumes where it left off when it comes round again.
     sessions = {}        # sid -> Session, in progress
-    done = {}            # sid -> time last seen, for completed plain files
-    frozen = set()       # sids of captured parts/manifests: never re-collect
+    completed = {}       # sid -> basename already written, for quiet repeats
     joined = set()       # manifest paths already rebuilt
     received = []        # paths written this run
     seen_parts = set()
@@ -534,24 +530,31 @@ def main():
                         continue
 
                     # A finished transfer stays on screen -- the sender loops it
-                    # until you stop it. Without this guard the receiver would
-                    # re-collect and re-write the same file forever and never be
-                    # free to catch the next one.
-                    if fr.sid in frozen:
-                        continue
-                    if fr.sid in done:
-                        if args.rearm and now - done[fr.sid] > args.rearm:
-                            del done[fr.sid]       # long gone; a deliberate re-send
-                        else:
-                            done[fr.sid] = now     # still on screen; keep ignoring
-                            continue
-
+                    # until you stop it -- so its frames arrive over and over.
+                    # They are collected again anyway, and the duplicate is
+                    # dropped at the write instead of here.
+                    #
+                    # Skipping them by session id looks cheaper and is wrong. A
+                    # session id is 16 bits of sha256(content) with no filename
+                    # in it, so two transfers that share one identical part --
+                    # v1 and v2 of an archive, where most parts didn't change --
+                    # share that part's id. Ignoring an id we have already seen
+                    # drops that part from the second transfer, which then waits
+                    # for a piece that never comes. Nor can a time window tell
+                    # the two cases apart: back-to-back sends look exactly like
+                    # a loop. Only the content can, and that means collecting it.
+                    #
+                    # What a repeat does buy is silence: a session we have
+                    # already written announces nothing and draws no progress.
                     sess = sessions.get(fr.sid)
                     if sess is None:
                         sess = sessions[fr.sid] = Session(fr)
-                        line.say(f"\nSignal locked: session {fr.sid:04X}, {fr.proto}, "
-                                 f"{fr.total} frames{', gzip' if fr.flags & 1 else ''}")
-                    if sess.add(fr):
+                        sess.quiet = fr.sid in completed
+                        if not sess.quiet:
+                            line.say(f"\nSignal locked: session {fr.sid:04X}, {fr.proto}, "
+                                     f"{fr.total} frames"
+                                     f"{', gzip' if fr.flags & 1 else ''}")
+                    if sess.add(fr) and not sess.quiet:
                         touched = sess
 
                 if touched is not None:
@@ -580,8 +583,13 @@ def main():
                         if is_piece(name):
                             # Part of an auto-split transfer: save the piece, then see
                             # whether the whole file can be rebuilt yet.
-                            frozen.add(sid)
+                            completed[sid] = safe_name(name)
                             path, note = save_bytes(args.out, name, content, exact=True)
+                            if note == "duplicate":
+                                # Same piece round again on a later pass. Nothing
+                                # on disk changed, so there is nothing to rejoin
+                                # and nothing worth printing.
+                                continue
                             seen_parts.add(os.path.basename(path))
                             kind = "manifest" if name.endswith(".qrmanifest") else "part"
                             line.say(f"Captured {kind}: {os.path.basename(path)}")
@@ -602,7 +610,7 @@ def main():
                                 finished = True
                                 if args.clean_parts:
                                     removed = 0
-                                    for p in _JOIN_PARTS.get(j.manifest, []) + [j.manifest]:
+                                    for p in list(j.parts) + [j.manifest]:
                                         try:
                                             os.remove(p)
                                             removed += 1
@@ -622,11 +630,17 @@ def main():
                             continue
 
                         # An ordinary single-file transfer.
+                        seen_before = sid in completed      # read before recording
                         path, note = save_bytes(args.out, name, content)
-                        done[sid] = time.time()
+                        completed[sid] = safe_name(name)
                         if note == "duplicate":
-                            line.say(f"\nReceived {name} again {DASH} byte-identical to "
-                                     f"{path}, kept the existing copy.")
+                            # Say it once, so a deliberate re-send gets an
+                            # acknowledgement, but a sender looping the same
+                            # file all afternoon does not fill the terminal.
+                            if not seen_before:
+                                line.say(f"\nReceived {name} again {DASH} byte-identical "
+                                         f"to {path}, kept the existing copy.")
+                            continue
                         else:
                             line.say(f"\n{OK} Received {os.path.basename(path)} "
                                      f"({len(content):,} bytes). Checksum verified {ARROW} {path}")
@@ -642,8 +656,7 @@ def main():
                         line.say(f"\nCould not write {name}: {exc}")
                         line.say("  Nothing was marked done, so it will be "
                                  "re-collected on its next showing.")
-                        done.pop(sid, None)
-                        frozen.discard(sid)
+                        completed.pop(sid, None)
                         continue
 
                 now = time.time()

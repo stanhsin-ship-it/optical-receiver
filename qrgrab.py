@@ -17,11 +17,16 @@ send as many files and folders from the far side as you like: each transfer is
 written, verified and announced, then the receiver goes straight back to
 scanning. Nothing has to be restarted between files.
 
+A folder is sent as one .tar and arrives as a folder: once the checksum
+verifies, the archive is unpacked beside itself, so what you sent is what you
+get. The .tar is kept as well, and --no-untar leaves it packed.
+
 Usage:
     python3 qrgrab.py                      # capture the primary monitor, stay up
     python3 qrgrab.py --monitor 2          # a specific monitor
     python3 qrgrab.py --fps 15 --out ./in  # grab rate and output folder
     python3 qrgrab.py --once               # old behaviour: exit after one file
+    python3 qrgrab.py --no-untar           # keep folder transfers as .tar
 
 The sender loops forever, so start this first or second -- it joins mid-stream.
 Ctrl-C to stop; it prints everything received, and for any transfer left
@@ -311,6 +316,104 @@ def save_bytes(out_dir, name, content, exact=False):
     return path, "written"
 
 
+TAR_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar.zst")
+
+
+def is_archive(name):
+    """True for names the sender produces when it packs a folder."""
+    low = os.path.basename(name).lower()
+    return any(low.endswith(s) for s in TAR_SUFFIXES)
+
+
+def archive_stem(name):
+    base = os.path.basename(name)
+    for suffix in sorted(TAR_SUFFIXES, key=len, reverse=True):
+        if base.lower().endswith(suffix):
+            return base[:-len(suffix)] or base
+    return base
+
+
+def unique_dir(parent, base):
+    """A directory name under parent that does not exist yet."""
+    candidate = os.path.join(parent, base)
+    n = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(parent, f"{base} ({n})")
+        n += 1
+    return candidate
+
+
+def safe_members(tar, dest):
+    """Return (members, refused) after checking every entry stays under dest.
+
+    extractall() will happily write through '../' or an absolute path in a tar
+    entry. The filter='data' argument that fixes this arrived in Python 3.12
+    and was only backported to late 3.10/3.11 patch releases, and this runs on
+    whatever Python the client happens to have -- so the check is done here
+    rather than assumed. The archive comes from a machine you trust, but it
+    lands on the machine you are sitting at, and a corrupt transfer can produce
+    a member name nobody intended.
+    """
+    members, refused = [], []
+    dest_real = os.path.realpath(dest)
+    for m in tar.getmembers():
+        name = m.name.replace("\\", "/")
+        parts = [p for p in name.split("/") if p not in ("", ".")]
+        if os.path.isabs(name) or name.startswith("/") or ".." in parts:
+            refused.append(m.name)
+            continue
+        if m.ischr() or m.isblk() or m.isfifo():
+            refused.append(m.name)         # device nodes have no business here
+            continue
+        target = os.path.realpath(os.path.join(dest_real, *parts))
+        if target != dest_real and not target.startswith(dest_real + os.sep):
+            refused.append(m.name)
+            continue
+        if m.issym() or m.islnk():
+            link = m.linkname.replace("\\", "/")
+            base = dest_real if m.islnk() else os.path.dirname(target)
+            resolved = os.path.realpath(os.path.join(base, link))
+            if resolved != dest_real and not resolved.startswith(dest_real + os.sep):
+                refused.append(m.name)     # link pointing out of the folder
+                continue
+        members.append(m)
+    return members, refused
+
+
+def untar(path, out_dir):
+    """Unpack a received folder archive. Returns (dest, count, refused, err).
+
+    The sender tars a folder with its own top-level name inside, so the natural
+    result is out_dir/<folder>/... -- exactly what `tar xf` in out_dir would
+    give. Two cases get a directory of their own instead: an archive whose
+    members would otherwise scatter loose across out_dir, and one whose folder
+    name is already taken, which is the same no-clobber rule the file writer
+    follows.
+    """
+    import tarfile
+
+    try:
+        with tarfile.open(path, "r:*") as tar:
+            roots = set()
+            for m in tar.getmembers():
+                parts = [p for p in m.name.replace("\\", "/").split("/")
+                         if p not in ("", ".")]
+                if parts:
+                    roots.add(parts[0])
+            scatters = len(roots) != 1
+            taken = any(os.path.exists(os.path.join(out_dir, r)) for r in roots)
+            dest = (unique_dir(out_dir, archive_stem(path)) if (scatters or taken)
+                    else out_dir)
+            os.makedirs(dest, exist_ok=True)
+
+            members, refused = safe_members(tar, dest)
+            tar.extractall(dest, members=members)
+            files = sum(1 for m in members if m.isfile())
+        return dest, files, refused, None
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        return None, 0, [], str(exc)
+
+
 def decode_frame(gray, detector):
     """Return a list of decoded QR strings found in a grayscale image.
 
@@ -371,6 +474,31 @@ class Line:
         """A permanent line that doesn't collide with the status line."""
         self.clear()
         print(*args, flush=True)
+
+
+def report_untar(line, path, args):
+    """Unpack a folder archive that just landed, and say what happened.
+
+    Never fatal: a receiver that has been up all day must not go down because
+    one archive was truncated or the disk filled mid-extract. The .tar is kept
+    either way, so a failure here costs nothing but the convenience.
+    """
+    if not is_archive(path):
+        return
+    if args.no_untar:
+        line.say(f"   Folder archive; unpack with:  tar xf {os.path.basename(path)}")
+        return
+    dest, count, refused, err = untar(path, args.out)
+    if err:
+        line.say(f"   Could not unpack it ({err}). The archive is kept at {path}")
+        return
+    where = os.path.relpath(dest, args.out)
+    where = "" if where == "." else where + os.sep
+    line.say(f"   Unpacked {count} file(s) {ARROW} {os.path.join(args.out, where)}")
+    if refused:
+        line.say(f"   Refused {len(refused)} unsafe entr{'y' if len(refused) == 1 else 'ies'} "
+                 f"(path escapes the folder): {', '.join(refused[:3])}"
+                 f"{' …' if len(refused) > 3 else ''}")
 
 
 Join = namedtuple("Join", "manifest name ok detail missing total path parts")
@@ -457,6 +585,11 @@ def main():
     ap.add_argument("--forget", type=float, default=900.0, metavar="SECS",
                     help="Drop a half-collected session that has not been seen for "
                          "this long, reporting its missing frames. Default 900.")
+    ap.add_argument("--no-untar", action="store_true",
+                    help="Keep a received folder archive as a .tar instead of "
+                         "unpacking it. By default a transfer that arrives as a "
+                         "tar is extracted next to it, since a folder was what "
+                         "was sent; the .tar is kept either way.")
     ap.add_argument("--clean-parts", action="store_true",
                     help="After a split transfer is rebuilt and its checksum "
                          "verified, delete the .qrpart pieces and manifest.")
@@ -603,9 +736,7 @@ def main():
                                 size = os.path.getsize(j.path)
                                 line.say(f"\n{OK} Rebuilt {j.name} ({size:,} bytes) from "
                                          f"{j.total} parts. Checksum verified {ARROW} {j.path}")
-                                if j.name.endswith(".tar"):
-                                    line.say("   It's a folder archive; unpack with:  "
-                                             f"tar xf {os.path.basename(j.path)}")
+                                report_untar(line, j.path, args)
                                 received.append(j.path)
                                 finished = True
                                 if args.clean_parts:
@@ -647,6 +778,7 @@ def main():
                             if note == "renamed":
                                 line.say(f"   (kept as {os.path.basename(path)}: a different "
                                          f"file called {name} was already here)")
+                            report_untar(line, path, args)
                         received.append(path)
                         if args.once:
                             return 0

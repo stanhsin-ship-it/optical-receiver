@@ -12,15 +12,21 @@ It accepts both senders:
     qrsend.py    / qrrecv.html    -> proto QRTX1, magic 'QT'  (text)
     qrsendbin.py / qrrecvbin.html -> proto QRTX2, magic 'QB'  (binary, may gzip)
 
+It STAYS RUNNING. Leave one qrgrab open on the client for the whole session and
+send as many files and folders from the far side as you like: each transfer is
+written, verified and announced, then the receiver goes straight back to
+scanning. Nothing has to be restarted between files.
+
 Usage:
-    python3 qrgrab.py                      # capture the primary monitor
+    python3 qrgrab.py                      # capture the primary monitor, stay up
     python3 qrgrab.py --monitor 2          # a specific monitor
     python3 qrgrab.py --fps 15 --out ./in  # grab rate and output folder
+    python3 qrgrab.py --once               # old behaviour: exit after one file
 
 The sender loops forever, so start this first or second -- it joins mid-stream.
-It stops on its own once every frame is in and the SHA-256 checks out.
-Ctrl-C to quit early; it prints which frame indices are still missing so you
-can replay just those with  qrsendbin.py --only ...
+Ctrl-C to stop; it prints everything received, and for any transfer left
+unfinished, which frame indices are missing so you can replay just those with
+  qrsendbin.py <file> --only 7,19,55-61
 
 Requires: opencv-python-headless (or opencv-python), mss, numpy.
     pip install opencv-python-headless mss numpy --user
@@ -33,6 +39,7 @@ import os
 import struct
 import sys
 import time
+from collections import namedtuple
 
 import numpy as np
 from mss import mss as _mss_factory
@@ -55,6 +62,55 @@ except Exception:
 import cv2  # always used for colour conversion / resize, and as decode fallback
 if _DECODER is None:
     _DECODER = "opencv"
+
+# The receiver runs on whatever client is driving the remote desktop -- macOS,
+# Windows or Linux. A legacy Windows console (cp437/cp1252) cannot encode a
+# tick mark or an arrow, and printing one raises UnicodeEncodeError. That used
+# to cost at most one line on an already-finished run; now that a receiver is
+# expected to stay up for hours it would take the whole session down mid
+# transfer. So: never let stdout raise, and fall back to ASCII when the
+# console can't prove it handles more.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (ValueError, OSError):
+        pass
+
+
+def _console_handles(text):
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        text.encode(enc)
+        return True
+    except (UnicodeEncodeError, LookupError):
+        return False
+
+
+_FANCY = _console_handles("✅→…—")
+OK = "✅" if _FANCY else "OK:"
+ARROW = "→" if _FANCY else "->"
+ELL = "…" if _FANCY else "..."
+DASH = "—" if _FANCY else "--"
+
+# Characters a Linux sender may legitimately put in a filename that Windows
+# refuses to create. Both the saver and the auto-join build names through
+# safe_name(), so a sanitised part still matches the manifest asking for it.
+_WIN_BAD = '<>:"/\\|?*'
+_WIN_RESERVED = ({"CON", "PRN", "AUX", "NUL"}
+                 | {f"COM{i}" for i in range(1, 10)}
+                 | {f"LPT{i}" for i in range(1, 10)})
+
+
+def safe_name(name):
+    """Return a basename the local filesystem will actually accept."""
+    if os.name != "nt":
+        return os.path.basename(name) or "received.bin"
+    base = os.path.basename(name.replace("\\", "/")) or "received.bin"
+    base = "".join("_" if (ch in _WIN_BAD or ord(ch) < 32) else ch for ch in base)
+    base = base.rstrip(" .") or "received.bin"
+    if base.split(".")[0].upper() in _WIN_RESERVED:
+        base = "_" + base
+    return base
 
 BASE45_CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
 B45_REV = {c: i for i, c in enumerate(BASE45_CHARSET)}
@@ -106,67 +162,63 @@ def crc16_ccitt(data: bytes) -> int:
     return crc
 
 
-def peek_sid(text: str):
-    """Return the session id of a decoded frame without collecting it, or None
-    if it isn't one of ours. Lets the loop skip a session it already finished."""
+Frame = namedtuple("Frame", "proto sid flags total idx payload")
+
+
+def parse_frame(text: str):
+    """Decode one QR string into a Frame, or None if it isn't one of ours.
+
+    One parse serves both jobs the loop needs -- deciding which session a code
+    belongs to, and collecting it -- so a frame is never decoded twice.
+    """
     raw = b45_decode(text.strip())
     if not raw or len(raw) < 10:
         return None
-    if raw[:2] not in (BIN_MAGIC, TEXT_MAGIC):
+
+    if raw[:2] == BIN_MAGIC:
+        proto, hdr = "QRTX2", 9        # magic2 sid2 flags1 total2 idx2
+    elif raw[:2] == TEXT_MAGIC:
+        proto, hdr = "QRTX1", 8        # magic2 sid2 total2 idx2
+    else:
         return None
+
     body_len = len(raw) - 2
     if crc16_ccitt(raw[:body_len]) != struct.unpack(">H", raw[body_len:])[0]:
         return None
-    return struct.unpack(">H", raw[2:4])[0]
+
+    sid = struct.unpack(">H", raw[2:4])[0]
+    if proto == "QRTX2":
+        flags = raw[4]
+        total, idx = struct.unpack(">HH", raw[5:9])
+    else:
+        flags = 0
+        total, idx = struct.unpack(">HH", raw[4:8])
+    if total == 0 or idx >= total:
+        return None
+    return Frame(proto, sid, flags, total, idx, raw[hdr:body_len])
 
 
 class Session:
     """Collects frames for one transfer and reassembles when complete."""
 
-    def __init__(self):
-        self.sid = None
-        self.total = None
-        self.flags = 0
-        self.proto = None
+    def __init__(self, fr: Frame):
+        self.sid = fr.sid
+        self.total = fr.total
+        self.flags = fr.flags
+        self.proto = fr.proto
         self.chunks = {}
+        self.started = self.last = time.time()
 
-    def offer(self, text: str) -> bool:
-        """Feed one decoded QR string. Returns True if it added a new frame."""
-        raw = b45_decode(text.strip())
-        if not raw or len(raw) < 10:
+    def add(self, fr: Frame) -> bool:
+        """Take one frame. Returns True if it was new."""
+        self.last = time.time()
+        if fr.total != self.total or fr.proto != self.proto:
+            # Session ids are 16 bits of a content hash, so two unrelated files
+            # can collide. A different frame count proves it isn't this file.
             return False
-
-        if raw[:2] == BIN_MAGIC:
-            proto, hdr = "QRTX2", 9        # magic2 sid2 flags1 total2 idx2
-        elif raw[:2] == TEXT_MAGIC:
-            proto, hdr = "QRTX1", 8        # magic2 sid2 total2 idx2
-        else:
+        if fr.idx in self.chunks:
             return False
-
-        body_len = len(raw) - 2
-        if crc16_ccitt(raw[:body_len]) != struct.unpack(">H", raw[body_len:])[0]:
-            return False
-
-        sid = struct.unpack(">H", raw[2:4])[0]
-        if proto == "QRTX2":
-            flags = raw[4]
-            total, idx = struct.unpack(">HH", raw[5:9])
-        else:
-            flags = 0
-            total, idx = struct.unpack(">HH", raw[4:8])
-        if idx >= total:
-            return False
-
-        if self.sid is None:
-            self.sid, self.total, self.flags, self.proto = sid, total, flags, proto
-            print(f"\nSignal locked: session {sid:04X}, {proto}, {total} frames"
-                  f"{', gzip' if flags & 1 else ''}")
-        elif sid != self.sid:
-            return False  # a different file; ignore until reset
-
-        if idx in self.chunks:
-            return False
-        self.chunks[idx] = raw[hdr:body_len]
+        self.chunks[fr.idx] = fr.payload
         return True
 
     @property
@@ -189,7 +241,9 @@ class Session:
         runs.append(str(a) if a == b else f"{a}-{b}")
         return ",".join(runs)
 
-    def assemble(self, out_dir):
+    def decode_payload(self):
+        """Return (name, content, err). Verifies the SHA-256 but writes nothing;
+        the caller decides where the bytes land and how to handle collisions."""
         blob = b"".join(self.chunks[i] for i in range(self.total))
         # QRTX1 (text sender) always gzips and carries no flag; QRTX2 (binary)
         # sets bit 0 only when gzip actually helped.
@@ -198,24 +252,62 @@ class Session:
             try:
                 blob = gzip.decompress(blob)
             except OSError:
-                return None, "gzip decompression failed -- frames corrupt"
+                return None, None, "gzip decompression failed -- frames corrupt"
         # manifest: PROTO \n name \n sha256 \n <content>
         # maxsplit=3 keeps any newlines inside the file content intact.
         parts = blob.split(b"\n", 3)
         if len(parts) < 4:
-            return None, "payload manifest malformed"
-        proto, name, want = parts[0].decode(errors="replace"), \
-            parts[1].decode(errors="replace"), parts[2].decode(errors="replace")
+            return None, None, "payload manifest malformed"
+        name = parts[1].decode(errors="replace")
+        want = parts[2].decode(errors="replace")
         content = parts[3]
         got = hashlib.sha256(content).hexdigest()
         if got != want:
-            return None, f"checksum mismatch (want {want[:12]}…, got {got[:12]}…)"
-        os.makedirs(out_dir, exist_ok=True)
-        safe = os.path.basename(name) or "received.bin"
-        path = os.path.join(out_dir, safe)
-        with open(path, "wb") as fh:
-            fh.write(content)
-        return path, None
+            return None, None, f"checksum mismatch (want {want[:12]}..., got {got[:12]}...)"
+        return name, content, None
+
+
+def is_piece(name):
+    """True for the bookkeeping files of an auto-split transfer."""
+    base = os.path.basename(name)
+    return base.endswith(".qrmanifest") or (".qrpart" in base and "-of-" in base)
+
+
+def save_bytes(out_dir, name, content, exact=False):
+    """Write content to out_dir, never silently clobbering a different file.
+
+    Returns (path, note) with note one of 'written', 'duplicate', 'renamed'.
+    Running for hours means the same name can legitimately arrive twice, and
+    losing the first copy to a same-named second transfer would be the worst
+    possible failure for a tool whose whole job is moving files intact.
+
+    exact=True keeps the literal filename: parts and manifests must keep theirs
+    or the auto-join can't find them, and a re-arrived part is byte-identical
+    by construction, so rewriting it costs nothing.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    safe = safe_name(name)
+    path = os.path.join(out_dir, safe)
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as fh:
+                old = fh.read()
+        except OSError:
+            old = None
+        if old == content:
+            return path, "duplicate"
+        if not exact:
+            stem, ext = os.path.splitext(safe)
+            n = 2
+            while os.path.exists(os.path.join(out_dir, f"{stem} ({n}){ext}")):
+                n += 1
+            path = os.path.join(out_dir, f"{stem} ({n}){ext}")
+            with open(path, "wb") as fh:
+                fh.write(content)
+            return path, "renamed"
+    with open(path, "wb") as fh:
+        fh.write(content)
+    return path, "written"
 
 
 def decode_frame(gray, detector):
@@ -274,16 +366,34 @@ class Line:
             print(" " * self.width, end="\r", flush=True)
             self.width = 0
 
+    def say(self, *args):
+        """A permanent line that doesn't collide with the status line."""
+        self.clear()
+        print(*args, flush=True)
 
-def try_autojoin(out_dir):
+
+Join = namedtuple("Join", "manifest name ok detail missing total path")
+
+# Part paths consumed by each successful join, so --clean-parts can remove
+# exactly what was used and nothing else.
+_JOIN_PARTS = {}
+
+
+def try_autojoin(out_dir, skip=()):
     """If a .qrmanifest and all its parts are present in out_dir, rebuild the
-    original file, verify its whole-file SHA-256, and write it. Returns a list
-    of (name, ok, detail) for each manifest found, or [] if none are complete."""
+    original file, verify its whole-file SHA-256, and write it.
+
+    skip holds manifests already rebuilt in this run: a long-lived receiver
+    re-checks after every captured piece, and without this it would rebuild a
+    finished file again on each one.
+    """
     import glob
     import json
 
     results = []
     for mpath in sorted(glob.glob(os.path.join(out_dir, "*.qrmanifest"))):
+        if mpath in skip:
+            continue
         try:
             with open(mpath, encoding="utf-8") as fh:
                 m = json.load(fh)
@@ -293,31 +403,37 @@ def try_autojoin(out_dir):
             continue
         name, total = m["name"], m["parts"]
         width = m.get("part_width", max(3, len(str(total))))
-        parts, missing = [], []
+        parts, missing, ppaths = [], [], []
         for idx in range(1, total + 1):
             pname = f"{name}.qrpart{idx:0{width}d}-of-{total}"
-            ppath = os.path.join(out_dir, pname)
+            ppath = os.path.join(out_dir, safe_name(pname))
             if os.path.exists(ppath):
                 with open(ppath, "rb") as fh:
                     parts.append(fh.read())
+                ppaths.append(ppath)
             else:
                 missing.append(idx)
         if missing:
-            results.append((name, False, f"missing parts {missing}", len(missing), total))
+            results.append(Join(mpath, name, False, f"missing parts {missing}",
+                                len(missing), total, None))
             continue
         data = b"".join(parts)
         if hashlib.sha256(data).hexdigest() != m["sha256"]:
-            results.append((name, False, "whole-file checksum failed", 0, total))
+            results.append(Join(mpath, name, False, "whole-file checksum failed",
+                                0, total, None))
             continue
-        out_path = os.path.join(out_dir, name)
-        with open(out_path, "wb") as fh:
-            fh.write(data)
-        results.append((name, True, out_path, 0, total))
+        path, note = save_bytes(out_dir, name, data)
+        # Remember the pieces this rebuild consumed, so --clean-parts removes
+        # exactly those and never a part belonging to another transfer.
+        _JOIN_PARTS[mpath] = ppaths
+        results.append(Join(mpath, name, True, note, 0, total, path))
     return results
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Screen-capture receiver for optical QR transfer.")
+    ap = argparse.ArgumentParser(
+        description="Screen-capture receiver for optical QR transfer. "
+                    "Stays running and accepts one transfer after another.")
     ap.add_argument("--monitor", type=int, default=1,
                     help="Monitor number as mss sees it (1 = primary). Default 1.")
     ap.add_argument("--fps", type=float, default=15.0,
@@ -332,18 +448,42 @@ def main():
                          "decoded once two consecutive grabs match, which rejects "
                          "codes caught mid-repaint by NoMachine. Turn off only if the "
                          "screen never holds a code still.")
+    ap.add_argument("--once", action="store_true",
+                    help="Exit after the first completed file (the old behaviour). "
+                         "By default the receiver keeps running and takes transfer "
+                         "after transfer until you press Ctrl-C.")
+    ap.add_argument("--rearm", type=float, default=300.0, metavar="SECS",
+                    help="A finished file is ignored while its frames are still on "
+                         "screen. Once they have been gone this long, sending the "
+                         "same file again is treated as a new transfer. Default 300. "
+                         "0 = never accept the same session twice in one run.")
+    ap.add_argument("--forget", type=float, default=900.0, metavar="SECS",
+                    help="Drop a half-collected session that has not been seen for "
+                         "this long, reporting its missing frames. Default 900.")
+    ap.add_argument("--clean-parts", action="store_true",
+                    help="After a split transfer is rebuilt and its checksum "
+                         "verified, delete the .qrpart pieces and manifest.")
     args = ap.parse_args()
 
     detector = cv2.QRCodeDetector()
-    sess = Session()
     period = 1.0 / args.fps
     last_report = 0.0
+    last_sweep = time.time()
     grabbed = 0
     prev = None          # previous grayscale grab, for the settled-frame gate
     stable = not args.no_stable
     line = Line()
-    seen_parts = set()   # filenames of parts/manifests captured so far
-    done_sids = set()    # session ids already completed — never re-collect them
+
+    # Several transfers can be in flight across one screen loop, so sessions are
+    # tracked by id rather than one at a time. That also means a half-collected
+    # transfer no longer blocks the next one, and a session interrupted by other
+    # traffic resumes where it left off when it comes round again.
+    sessions = {}        # sid -> Session, in progress
+    done = {}            # sid -> time last seen, for completed plain files
+    frozen = set()       # sids of captured parts/manifests: never re-collect
+    joined = set()       # manifest paths already rebuilt
+    received = []        # paths written this run
+    seen_parts = set()
 
     _open = _MSS if _MSS is not None else _mss_factory
     with _open() as sct:
@@ -354,9 +494,11 @@ def main():
               f"  at {args.fps:g} fps  (decoder: {_DECODER})")
         if _DECODER == "opencv":
             print("Note: using OpenCV. pyzbar decodes marginal frames more "
-                  "reliably — install libzbar0 + pyzbar if frames stall.")
+                  "reliably - install libzbar0 + pyzbar if frames stall.")
+        print(f"Writing to {os.path.abspath(args.out)}")
         print("Waiting for QR signal. Fill the captured area with the sending window.")
-        print("Ctrl-C to stop.\n")
+        print("Exits after one file (--once).\n" if args.once else
+              "Stays up for transfer after transfer. Ctrl-C to stop.\n")
 
         try:
             while True:
@@ -384,74 +526,144 @@ def main():
                             time.sleep(dt)
                         continue
 
-                added = False
+                touched = None
+                now = time.time()
                 for t in decode_frame(img, detector):
-                    # A completed part often stays on screen (the sender holds and
-                    # repeats it). Without this guard the receiver re-locks that
-                    # same session, re-collects the part it already has, and never
-                    # frees itself to catch the *next* part — a livelock that looks
-                    # like "stuck on part 2". If we're not already locked onto a
-                    # session, ignore frames from any session we've finished.
-                    if sess.sid is None and peek_sid(t) in done_sids:
+                    fr = parse_frame(t)
+                    if fr is None:
                         continue
-                    if sess.offer(t):
-                        added = True
-                if added:
-                    line.show("  " + draw_bar(len(sess.chunks), sess.total)
-                              + "   missing: " + (sess.missing_spec() or "none"))
 
-                if sess.complete:
-                    path, err = sess.assemble(args.out)
-                    line.clear()
-                    print()
+                    # A finished transfer stays on screen -- the sender loops it
+                    # until you stop it. Without this guard the receiver would
+                    # re-collect and re-write the same file forever and never be
+                    # free to catch the next one.
+                    if fr.sid in frozen:
+                        continue
+                    if fr.sid in done:
+                        if args.rearm and now - done[fr.sid] > args.rearm:
+                            del done[fr.sid]       # long gone; a deliberate re-send
+                        else:
+                            done[fr.sid] = now     # still on screen; keep ignoring
+                            continue
+
+                    sess = sessions.get(fr.sid)
+                    if sess is None:
+                        sess = sessions[fr.sid] = Session(fr)
+                        line.say(f"\nSignal locked: session {fr.sid:04X}, {fr.proto}, "
+                                 f"{fr.total} frames{', gzip' if fr.flags & 1 else ''}")
+                    if sess.add(fr):
+                        touched = sess
+
+                if touched is not None:
+                    tag = f"{touched.sid:04X} " if len(sessions) > 1 else ""
+                    line.show("  " + tag + draw_bar(len(touched.chunks), touched.total)
+                              + "   missing: " + (touched.missing_spec() or "none"))
+
+                for sid, sess in list(sessions.items()):
+                    if not sess.complete:
+                        continue
+                    del sessions[sid]
+                    prev = None          # writing took time; re-baseline the gate
+                    name, content, err = sess.decode_payload()
+
                     if err:
-                        print("Reassembly failed:", err)
-                        print("Reset the sender and capture again, or replay --only",
-                              sess.missing_spec() or "(all)")
-                        # Don't abort a multi-part run over one bad session; keep
-                        # going and let this part be re-collected on its next
-                        # showing (so it is NOT added to done_sids).
-                        sess = Session()
-                        prev = None
+                        line.say(f"\nSession {sid:04X}: reassembly failed -- {err}")
+                        line.say("  Left open for re-collection on its next showing; "
+                                 f"or replay --only {sess.missing_spec() or '(all)'}")
                         continue
 
-                    fname = os.path.basename(path)
-                    is_manifest = fname.endswith(".qrmanifest")
-                    is_part = ".qrpart" in fname and "-of-" in fname
+                    # A write can fail on the client for reasons that have
+                    # nothing to do with the transfer -- a full disk, a synced
+                    # folder locked by the OS. Losing one file is acceptable;
+                    # losing a receiver that has been up for hours is not.
+                    try:
+                        if is_piece(name):
+                            # Part of an auto-split transfer: save the piece, then see
+                            # whether the whole file can be rebuilt yet.
+                            frozen.add(sid)
+                            path, note = save_bytes(args.out, name, content, exact=True)
+                            seen_parts.add(os.path.basename(path))
+                            kind = "manifest" if name.endswith(".qrmanifest") else "part"
+                            line.say(f"Captured {kind}: {os.path.basename(path)}")
 
-                    if not is_manifest and not is_part:
-                        # An ordinary single-file transfer: done.
-                        size = os.path.getsize(path)
-                        print(f"Done. Wrote {path}  ({size} bytes). Checksum verified.")
-                        return 0
+                            joins = list(try_autojoin(args.out, joined))
+                            finished = False
+                            for j in joins:
+                                if not j.ok:
+                                    continue
+                                joined.add(j.manifest)
+                                size = os.path.getsize(j.path)
+                                line.say(f"\n{OK} Rebuilt {j.name} ({size:,} bytes) from "
+                                         f"{j.total} parts. Checksum verified {ARROW} {j.path}")
+                                if j.name.endswith(".tar"):
+                                    line.say("   It's a folder archive; unpack with:  "
+                                             f"tar xf {os.path.basename(j.path)}")
+                                received.append(j.path)
+                                finished = True
+                                if args.clean_parts:
+                                    removed = 0
+                                    for p in _JOIN_PARTS.get(j.manifest, []) + [j.manifest]:
+                                        try:
+                                            os.remove(p)
+                                            removed += 1
+                                        except OSError:
+                                            pass
+                                    line.say(f"   Cleaned up {removed} piece(s).")
+                            if finished and args.once:
+                                return 0
+                            if finished:
+                                line.say(f"   {len(received)} transfer(s) received. "
+                                         f"Waiting for the next one{ELL}")
+                                continue
 
-                    # Multi-part: record this piece, then see if we can rebuild.
-                    done_sids.add(sess.sid)
-                    seen_parts.add(fname)
-                    kind = "manifest" if is_manifest else "part"
-                    print(f"Captured {kind}: {fname}")
-                    joins = try_autojoin(args.out)
-                    for name, ok, detail, nmiss, total in joins:
-                        if ok:
-                            size = os.path.getsize(detail)
-                            print(f"\n✅ Rebuilt {name} ({size} bytes) from {total} parts. "
-                                  f"Checksum verified → {detail}")
-                            if name.endswith(".tar"):
-                                print(f"   It's a folder archive; unpack with:  tar xf {name}")
+                            pending = [f"{j.name}: {j.detail}" for j in joins if not j.ok]
+                            line.show(("  waiting for more parts" + ELL + " " + "; ".join(pending))
+                                      if pending else "  waiting for manifest" + ELL)
+                            continue
+
+                        # An ordinary single-file transfer.
+                        path, note = save_bytes(args.out, name, content)
+                        done[sid] = time.time()
+                        if note == "duplicate":
+                            line.say(f"\nReceived {name} again {DASH} byte-identical to "
+                                     f"{path}, kept the existing copy.")
+                        else:
+                            line.say(f"\n{OK} Received {os.path.basename(path)} "
+                                     f"({len(content):,} bytes). Checksum verified {ARROW} {path}")
+                            if note == "renamed":
+                                line.say(f"   (kept as {os.path.basename(path)}: a different "
+                                         f"file called {name} was already here)")
+                        received.append(path)
+                        if args.once:
                             return 0
-                    # Not complete yet: show how many parts still outstanding.
-                    pending = [d for _, ok, d, nm, tot in joins if not ok]
-                    if pending:
-                        line.show("  waiting for more parts… " + "; ".join(pending))
-                    else:
-                        line.show("  waiting for manifest…")
-                    sess = Session()      # reset to accept the next session
-                    prev = None
-                    continue
+                        line.say(f"   {len(received)} transfer(s) received. "
+                                 f"Waiting for the next one{ELL}")
+                    except OSError as exc:
+                        line.say(f"\nCould not write {name}: {exc}")
+                        line.say("  Nothing was marked done, so it will be "
+                                 "re-collected on its next showing.")
+                        done.pop(sid, None)
+                        frozen.discard(sid)
+                        continue
 
                 now = time.time()
-                if now - last_report > 3 and sess.sid is None:
-                    line.show(f"  …scanning ({grabbed} grabs, no signal yet)")
+
+                # Bound memory and surface abandoned transfers: a session nobody
+                # has shown us in --forget seconds is over, finished or not.
+                if now - last_sweep > 30:
+                    last_sweep = now
+                    for sid, s in list(sessions.items()):
+                        if now - s.last > args.forget:
+                            del sessions[sid]
+                            line.say(f"\nDropping stale session {sid:04X}: "
+                                     f"{len(s.chunks)}/{s.total} frames after "
+                                     f"{args.forget:.0f}s of silence.")
+                            line.say(f"  Replay the gaps with:  qrsendbin.py <file> "
+                                     f"--only {s.missing_spec()}")
+
+                if now - last_report > 3 and not sessions:
+                    tail = f", {len(received)} received" if received else ""
+                    line.show(f"  {ELL}scanning ({grabbed} grabs, no signal yet{tail})")
                     last_report = now
 
                 dt = period - (time.time() - t0)
@@ -461,27 +673,22 @@ def main():
         except KeyboardInterrupt:
             line.clear()
             print("\nStopped.")
-            if seen_parts:
-                joins = try_autojoin(args.out)
-                done = [n for n, ok, *_ in joins if ok]
-                if done:
-                    print("Rebuilt:", ", ".join(done))
-                for name, ok, detail, nmiss, total in joins:
-                    if not ok:
-                        print(f"{name}: incomplete — {detail}. "
-                              f"Re-send the missing part(s) and run again; captured "
-                              f"parts stay in {args.out}/.")
-                if not joins:
-                    print(f"Captured {len(seen_parts)} piece(s) but no manifest yet.")
-            elif sess.sid is None:
-                print("No signal was locked.")
-            else:
-                miss = sess.missing_spec()
+            if received:
+                print(f"Received {len(received)} file(s) into {os.path.abspath(args.out)}:")
+                for p in received:
+                    print(f"  {os.path.basename(p)}  ({os.path.getsize(p):,} bytes)")
+            for sid, s in sessions.items():
+                miss = s.missing_spec()
                 if miss:
-                    print(f"Session {sess.sid:04X}: {len(sess.chunks)}/{sess.total} frames.")
-                    print(f"Replay the gaps with:  qrsendbin.py <file> --only {miss}")
-                else:
-                    print("All frames were present but assembly never ran -- rerun.")
+                    print(f"Session {sid:04X}: {len(s.chunks)}/{s.total} frames captured.")
+                    print(f"  Replay the gaps with:  qrsendbin.py <file> --only {miss}")
+            if seen_parts:
+                for j in try_autojoin(args.out, joined):
+                    if not j.ok:
+                        print(f"{j.name}: incomplete {DASH} {j.detail}. Re-send the missing "
+                              f"part(s); captured pieces stay in {args.out}/.")
+            if not received and not sessions:
+                print("No signal was locked.")
             return 130
 
 

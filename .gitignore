@@ -1,0 +1,10 @@
+# macOS / Windows shell droppings
+.DS_Store
+Thumbs.db
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Files landed by the receiver; payloads, not source
+received/

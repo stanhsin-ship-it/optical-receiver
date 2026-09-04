@@ -10,8 +10,14 @@ line up with a run started either way.
 
 What the GUI adds:
 
-  * A file manager: browse the filesystem, pick a file, or pick a folder and
-    send the whole thing (qrsendbin packs a folder into one deterministic tar).
+  * A file manager: browse the filesystem and pick what to send. Ctrl-click
+    (Cmd-click on macOS) adds one item, shift-click takes a range, ctrl-a takes
+    every file in the folder. A folder is sent whole, packed into one
+    deterministic tar by qrsendbin.
+  * Several selections are queued into one loop. Each file already plans to its
+    own session, and the receiver tracks sessions independently, so five files
+    play back to back and land as five separate files -- no archive to unpack
+    and nothing to restart between them.
   * Every command-line switch as a widget, with a live "bytes per frame"
     readout so the effect of --version is visible before you commit.
   * An Analyze step that runs the real planner and reports frames, sessions,
@@ -127,6 +133,9 @@ def human_time(secs):
     if secs < 3600:
         return f"{secs // 60}m {secs % 60:02d}s"
     return f"{secs // 3600}h {(secs % 3600) // 60:02d}m"
+
+
+DOT = "·"          # separates file name from part label in captions
 
 
 def payload_size_for(version):
@@ -416,7 +425,8 @@ class FileBrowser(ttk.Frame):
         filt.pack(side="left", padx=4)
         filt.bind("<Return>", lambda e: self.refresh())
         ttk.Button(row, text="Apply", width=6, command=self.refresh).pack(side="left")
-        ttk.Label(row, text="glob, e.g. *.bin", foreground="#555").pack(side="left", padx=6)
+        ttk.Label(row, text="glob, e.g. *.bin   |   ctrl/shift-click for several",
+                  foreground="#555").pack(side="left", padx=6)
 
         # The action row is packed before the list: pack() hands out slabs in
         # creation order, so claiming the bottom edge first keeps the buttons
@@ -426,10 +436,10 @@ class FileBrowser(ttk.Frame):
         ttk.Button(foot, text="Send selected", command=self.pick_selection).pack(side="left")
         ttk.Button(foot, text="Send this whole folder",
                    command=lambda: self.on_pick(self.cwd)).pack(side="left", padx=6)
-        ttk.Button(foot, text="Open file...", command=self.pick_dialog).pack(side="left")
+        ttk.Button(foot, text="Open file(s)...", command=self.pick_dialog).pack(side="left")
 
         cols = ("size", "modified")
-        self.tree = ttk.Treeview(self, columns=cols, selectmode="browse")
+        self.tree = ttk.Treeview(self, columns=cols, selectmode="extended")
         self.tree.heading("#0", text="Name")
         self.tree.heading("size", text="Size")
         self.tree.heading("modified", text="Modified")
@@ -441,6 +451,10 @@ class FileBrowser(ttk.Frame):
         self.tree.pack(side="left", fill="both", expand=True, pady=6)
         vsb.pack(side="left", fill="y", pady=6)
 
+        # "extended" is what gives ctrl-click and shift-click their usual
+        # meaning; ctrl-a rounds it out for "everything in this folder".
+        self.tree.bind("<Control-a>", self.select_all_files)
+        self.tree.bind("<Command-a>", self.select_all_files)   # macOS
         self.tree.bind("<Double-1>", self.on_activate)
         self.tree.bind("<Return>", self.on_activate)
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
@@ -512,34 +526,57 @@ class FileBrowser(ttk.Frame):
         except OSError:
             return ""
 
+    def selected_paths(self):
+        """Every highlighted row that still exists, in the order shown.
+
+        tree.selection() returns items in selection order, not list order, so
+        a shift-click range would otherwise queue bottom-to-top depending on
+        which end you started from. Sending follows what the eye sees.
+        """
+        chosen = set(self.tree.selection())
+        return [p for p in self.tree.get_children("")
+                if p in chosen and os.path.exists(p)]
+
     def selected_path(self):
-        sel = self.tree.selection()
-        return sel[0] if sel and os.path.exists(sel[0]) else None
+        paths = self.selected_paths()
+        return paths[0] if paths else None
 
     def on_select(self, _event=None):
-        path = self.selected_path()
-        if path and os.path.isfile(path):
-            self.on_pick(path)
+        # A folder among the picks is fine -- the sender tars it -- but a lone
+        # folder click is usually navigation, so it is not treated as a pick.
+        paths = self.selected_paths()
+        if len(paths) == 1 and os.path.isdir(paths[0]):
+            return
+        if paths:
+            self.on_pick(paths)
 
     def on_activate(self, _event=None):
-        path = self.selected_path()
-        if not path:
+        paths = self.selected_paths()
+        if not paths:
             return
-        if os.path.isdir(path):
-            self.chdir(path)
+        if len(paths) == 1 and os.path.isdir(paths[0]):
+            self.chdir(paths[0])
         else:
-            self.on_pick(path)
+            self.on_pick(paths)
+
+    def select_all_files(self, _event=None):
+        files = [p for p in self.tree.get_children("") if os.path.isfile(p)]
+        self.tree.selection_set(files)
+        if files:
+            self.on_pick(files)
+        return "break"
 
     def pick_selection(self):
-        path = self.selected_path()
-        if path:
-            self.on_pick(path)
+        paths = self.selected_paths()
+        if paths:
+            self.on_pick(paths)
 
     def pick_dialog(self):
-        path = filedialog.askopenfilename(initialdir=self.cwd, title="Choose a file to send")
-        if path:
-            self.chdir(os.path.dirname(path))
-            self.on_pick(path)
+        paths = filedialog.askopenfilenames(initialdir=self.cwd,
+                                            title="Choose file(s) to send")
+        if paths:
+            self.chdir(os.path.dirname(paths[0]))
+            self.on_pick(list(paths))
 
 
 # --------------------------------------------------------------------------
@@ -553,7 +590,7 @@ class App(tk.Tk):
         self.geometry("1180x760")
         self.minsize(980, 620)
 
-        self.target = None
+        self.targets = []
         self.plan = None            # (segments, was_split) from the last Analyze
         self.plan_key = None        # inputs the plan was built from
         self.player = None
@@ -723,30 +760,61 @@ class App(tk.Tk):
 
     # -- target / settings -------------------------------------------------
 
-    def set_target(self, path):
-        self.target = os.path.abspath(path)
+    @staticmethod
+    def folder_size(path):
+        n = total = 0
+        for dp, _, fns in os.walk(path):
+            for fn in fns:
+                n += 1
+                try:
+                    total += os.path.getsize(os.path.join(dp, fn))
+                except OSError:
+                    pass
+        return n, total
+
+    def set_target(self, paths):
+        """Accepts one path or a list of them, from any of the pick buttons."""
+        if isinstance(paths, str):
+            paths = [paths]
+        self.targets = [os.path.abspath(p) for p in paths]
         self.plan = None
-        if os.path.isdir(self.target):
-            n = total = 0
-            for dp, _, fns in os.walk(self.target):
-                for fn in fns:
-                    n += 1
-                    try:
-                        total += os.path.getsize(os.path.join(dp, fn))
-                    except OSError:
-                        pass
-            self.lbl_target.config(text="[folder] " + self.target)
-            self.lbl_target_info.config(
-                text=f"folder — {n} file(s), {human_bytes(total)}; "
-                     f"sent as one .tar, rebuild with  tar xf "
-                     f"{os.path.basename(self.target.rstrip(os.sep))}.tar")
+
+        if len(self.targets) == 1:
+            target = self.targets[0]
+            if os.path.isdir(target):
+                n, total = self.folder_size(target)
+                self.lbl_target.config(text="[folder] " + target)
+                self.lbl_target_info.config(
+                    text=f"folder — {n} file(s), {human_bytes(total)}; "
+                         f"sent as one .tar, unpacked on arrival by qrgrab")
+            else:
+                try:
+                    size = os.path.getsize(target)
+                except OSError:
+                    size = 0
+                self.lbl_target.config(text="[file]   " + target)
+                self.lbl_target_info.config(text=f"file — {human_bytes(size)}")
         else:
-            try:
-                size = os.path.getsize(self.target)
-            except OSError:
-                size = 0
-            self.lbl_target.config(text="[file]   " + self.target)
-            self.lbl_target_info.config(text=f"file — {human_bytes(size)}")
+            files = [p for p in self.targets if not os.path.isdir(p)]
+            folders = [p for p in self.targets if os.path.isdir(p)]
+            total = 0
+            for p in files:
+                try:
+                    total += os.path.getsize(p)
+                except OSError:
+                    pass
+            for p in folders:
+                total += self.folder_size(p)[1]
+            names = ", ".join(os.path.basename(p) for p in self.targets[:4])
+            if len(self.targets) > 4:
+                names += f", … (+{len(self.targets) - 4})"
+            what = f"{len(files)} file(s)" if files else ""
+            if folders:
+                what += (" and " if what else "") + f"{len(folders)} folder(s)"
+            self.lbl_target.config(text=f"[{len(self.targets)} selected] {names}")
+            self.lbl_target_info.config(
+                text=f"{what}, {human_bytes(total)} in total — sent one after "
+                     f"another in a single loop; each arrives as its own file")
         self.set_plan_text("Settings or selection changed — press Analyze.")
 
     def on_setting_changed(self, *_):
@@ -765,19 +833,38 @@ class App(tk.Tk):
         self.plan = None
 
     def settings_key(self):
-        return (self.target, int(self.v_version.get()), self.v_split.get(),
+        return (tuple(self.targets), int(self.v_version.get()), self.v_split.get(),
                 bool(self.v_nosplit.get()), clean_only(self.v_only.get()))
 
     def require_target(self):
-        if not self.target or not os.path.exists(self.target):
+        live = [p for p in self.targets if os.path.exists(p)]
+        if not live:
             messagebox.showinfo("qrsendgui", "Pick a file or folder on the left first.")
+            return False
+        self.targets = live
+        return True
+
+    def require_single(self, what):
+        """Some actions only make sense for one input at a time."""
+        if len(self.targets) != 1:
+            messagebox.showinfo(
+                "qrsendgui",
+                f"{what} works on one file at a time.\n\n"
+                f"{len(self.targets)} are selected — pick a single one first.")
             return False
         return True
 
     # -- planning (worker thread) -----------------------------------------
 
     def build_plan(self):
-        """Run the engine planner. Returns (segments, was_split, notes)."""
+        """Run the engine planner. Returns (segments, was_split, notes).
+
+        Several inputs become one playlist. Each file already plans to its own
+        session (a split one to a manifest plus a session per part), and the
+        receiver tracks sessions independently, so concatenating the segments
+        is all that "send these five files" means: they play back to back in
+        one loop and land as five separate files at the far end.
+        """
         version = int(self.v_version.get())
         payload = payload_size_for(version)
         if payload < 8:
@@ -787,7 +874,8 @@ class App(tk.Tk):
 
         if only:
             # Gap fill works on a single session, exactly like --only.
-            (blob, flags, digest), out = capture(QB.build_blob, self.target)
+            target = self.targets[0]
+            (blob, flags, digest), out = capture(QB.build_blob, target)
             notes.append(out)
             session = QB.session_from(digest)
             frames, out = capture(QB.chunk_blob, blob, payload, session, flags)
@@ -796,20 +884,31 @@ class App(tk.Tk):
             notes.append(out)
             frames = [frames[i] for i in indices]
             segs = [{"session": session, "frames": frames, "indices": indices,
-                     "label": f"replay {only}", "name": os.path.basename(self.target)}]
+                     "label": f"replay {only}", "name": os.path.basename(target)}]
             return segs, False, "".join(notes)
 
-        (content, name), out = capture(QB.read_input, self.target)
-        notes.append(out)
         if self.v_nosplit.get():
             split_size = 0
         else:
             split_size, out = capture(QB.parse_size, self.v_split.get())
             notes.append(out)
-        (segments, was_split), out = capture(
-            QB.plan_segments, content, name, payload, split_size)
-        notes.append(out)
-        return segments, was_split, "".join(notes)
+
+        segments, any_split = [], False
+        for target in self.targets:
+            (content, name), out = capture(QB.read_input, target)
+            notes.append(out)
+            (segs, was_split), out = capture(
+                QB.plan_segments, content, name, payload, split_size)
+            notes.append(out)
+            # Label each segment with its file, so the caption on screen says
+            # which of the five is playing rather than just "part 2 of 3".
+            if len(self.targets) > 1:
+                for seg in segs:
+                    seg["label"] = f"{name}  {DOT}  {seg['label']}" \
+                        if seg["label"] != name else name
+            segments.extend(segs)
+            any_split = any_split or was_split
+        return segments, any_split, "".join(notes)
 
     def plan_summary(self, segments, was_split):
         version = int(self.v_version.get())
@@ -820,13 +919,25 @@ class App(tk.Tk):
         total = sum(len(s["frames"]) for s in segments)
 
         # Repeats and gaps are real screen time, so count them in the estimate.
-        shown = total * (repeat if (was_split and len(segments) > 1) else 1)
-        gaps = gap * (len(segments) * (repeat if was_split else 1)) if len(segments) > 1 else gap
+        # The player repeats every segment whenever there is more than one --
+        # split parts and queued files alike -- so the same rule applies here,
+        # or the estimate drifts from the clock as soon as you queue two files.
+        reps = repeat if len(segments) > 1 else 1
+        shown = total * reps
+        gaps = gap * len(segments) * reps
         pass_secs = (shown + gaps) / fps
 
         lines = []
-        kind = "folder → tar" if os.path.isdir(self.target) else "file"
-        lines.append(f"Input       {os.path.basename(self.target)}  ({kind})")
+        if len(self.targets) == 1:
+            kind = "folder → tar" if os.path.isdir(self.targets[0]) else "file"
+            lines.append(f"Input       {os.path.basename(self.targets[0])}  ({kind})")
+        else:
+            names = ", ".join(os.path.basename(t) for t in self.targets[:3])
+            if len(self.targets) > 3:
+                names += f", … (+{len(self.targets) - 3} more)"
+            lines.append(f"Input       {len(self.targets)} items: {names}")
+            lines.append(f"            queued back to back; each lands as its "
+                         f"own file at the far end")
         lines.append(f"QR          version {version}, ECC H, "
                      f"{payload_size_for(version)} bytes/frame")
         if was_split:
@@ -879,6 +990,10 @@ class App(tk.Tk):
         cleaned = clean_only(self.v_only.get())
         if cleaned != self.v_only.get():
             self.v_only.set(cleaned)        # show what was understood
+        # A gap fill replays frame indices of one session; with several inputs
+        # selected there is no single session those indices belong to.
+        if cleaned and not self.require_single("Replaying selected frames"):
+            return
         if self.plan is not None and self.plan_key == self.settings_key():
             text, _, _ = self.plan_summary(*self.plan)
             self.set_plan_text(text)
@@ -899,7 +1014,9 @@ class App(tk.Tk):
                      f"{human_time(secs)} per pass.")
             then(self.plan)
 
-        self.log(f"Planning {os.path.basename(self.target)} …")
+        what = (os.path.basename(self.targets[0]) if len(self.targets) == 1
+                else f"{len(self.targets)} items")
+        self.log(f"Planning {what} …")
         self.run_async(self.build_plan, done)
 
     # -- actions -----------------------------------------------------------
@@ -960,7 +1077,7 @@ class App(tk.Tk):
 
     def do_dump(self):
         """Write PNG frames instead of playing them (single session, like --dump-dir)."""
-        if not self.require_target():
+        if not self.require_target() or not self.require_single("Dumping PNG frames"):
             return
         out_dir = filedialog.askdirectory(title="Folder for PNG frames")
         if not out_dir:
@@ -968,7 +1085,7 @@ class App(tk.Tk):
         version = int(self.v_version.get())
         payload = payload_size_for(version)
         only = clean_only(self.v_only.get())
-        target = self.target
+        target = self.targets[0]
 
         def work():
             (blob, flags, digest), out1 = capture(QB.build_blob, target)
